@@ -1,0 +1,9 @@
+[submodule "contrib/STAR"]
+	path = contrib/STAR
+	url = https://github.com/alexdobin/STAR
+[submodule "contrib/gatk"]
+	path = contrib/gatk
+	url = https://github.com/broadinstitute/gatk.git
+[submodule "contrib/picard"]
+	path = contrib/picard
+	url = https://github.com/broadinstitute/picard.git
