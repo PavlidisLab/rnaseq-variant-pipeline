@@ -5,7 +5,10 @@ import os
 from os.path import join
 
 """
-This pipeline largely based on https://software.broadinstitute.org/gatk/documentation/article.php?id=3891
+This pipeline largely based on GATK 3 guidelines for RNA-Seq variant calling
+adapted for GATK 4.
+
+Reference: https://software.broadinstitute.org/gatk/documentation/article.php?id=3891
 """
 
 class rnaseq_variant_pipeline(luigi.Config):
@@ -13,6 +16,7 @@ class rnaseq_variant_pipeline(luigi.Config):
     gatk_bin = luigi.Parameter()
 
     output_dir = luigi.Parameter()
+    tmp_dir = luigi.Parameter()
 
 cfg = rnaseq_variant_pipeline()
 
@@ -24,9 +28,11 @@ class ProduceReference(luigi.Task):
         return luigi.LocalTarget('references/hg38_ensembl98/Genome')
 
 class ProduceReferenceSequence(luigi.Task):
+    """
+    Produce a reference genome sequence.
+    """
     def output(self):
-        # TODO: figure better the path for this
-        return luigi.LocalTarget('../rnaseq-pipeline/Assemblies/hg38_ensembl98/Homo_sapiens.GRCh38.dna.primary_assembly.fa')
+        return luigi.LocalTarget('genomes/hg38_ensembl98/Homo_sapiens.GRCh38.dna.primary_assembly.fa')
 
 class ProduceSampleFastqs(luigi.Task):
     """
@@ -148,7 +154,7 @@ class AddOrReplaceReadGroups(ExternalProgramTask):
                 '--RGPL', 'platform',
                 '--RGPU', 'machine',
                 '--RGSM', 'sample',
-                '--TMP_DIR', '/cosmos/scratch/rnaseq-variant-pipeline']
+                '--TMP_DIR', cfg.tmp_dir]
 
     def run(self):
         self.output().makedirs()
@@ -167,14 +173,14 @@ class MarkDuplicates(ExternalProgramTask):
         return AddOrReplaceReadGroups(self.experiment_id, self.sample_id)
 
     def program_args(self):
-        return [gatk_bin,
+        return [cfg.gatk_bin,
                 'MarkDuplicatesSpark',
                 '--spark-master', 'local[{}]'.format(self.resources['cpu']),
                 '-I', self.input().path,
                 '-O', self.output().path,
                 '--create-output-bam-index',
-                '--tmp-dir', '/cosmos/scratch/rnaseq-variant-pipeline',
-                '--validation-stringency', 'silent',
+                '--tmp-dir', cfg.tmp_dir,
+                '--read-validation-stringency', 'SILENT',
                 '--metrics-file', join(os.path.dirname(self.output().path), 'output.metrics')]
 
     def run(self):
@@ -199,7 +205,7 @@ class SplitNCigarReads(ExternalProgramTask):
                 '-R', self.input()[0].path,
                 '-I', self.input()[1].path,
                 '-O', self.output().path,
-                '--tmp-dir', '/cosmos/scratch/rnaseq-variant-pipeline']
+                '--tmp-dir', cfg.tmp_dir]
 
     def run(self):
         self.output().makedirs()
@@ -226,7 +232,7 @@ class CallVariants(ExternalProgramTask):
                 '-O', self.output().path,
                 '--dont-use-soft-clipped-bases',
                 '--standard-min-confidence-threshold-for-calling', 30.0,
-                '--tmp-dir', '/cosmos/scratch/rnaseq-variant-pipeline']
+                '--tmp-dir', cfg.tmp_dir]
 
     def run(self):
         self.output().makedirs()
@@ -256,7 +262,7 @@ class FilterVariants(ExternalProgramTask):
                 '--filterExpression', 'FS > 30.0',
                 '--filterName', 'QD',
                 '--filterExpression', 'QD < 2.0',
-                '--tmp-dir', '/cosmos/scratch/rnaseq-variant-pipeline']
+                '--tmp-dir', cfg.tmp_dir]
 
     def run(self):
         self.output().makedirs()
