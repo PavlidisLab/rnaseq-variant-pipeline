@@ -20,19 +20,55 @@ class rnaseq_variant_pipeline(luigi.Config):
 
 cfg = rnaseq_variant_pipeline()
 
-class ProduceReference(luigi.Task):
-    """
-    Produce a reference.
-    """
-    def output(self):
-        return luigi.LocalTarget('references/hg38_ensembl98/Genome')
-
-class ProduceReferenceSequence(luigi.Task):
+class ProduceGenome(luigi.Task):
     """
     Produce a reference genome sequence.
     """
     def output(self):
-        return luigi.LocalTarget('genomes/hg38_ensembl98/Homo_sapiens.GRCh38.dna.primary_assembly.fa')
+        return luigi.LocalTarget('genomes/hg19_ensembl98/Homo_sapiens.GRCh37.dna.primary_assembly.fa')
+
+class ProduceGenomeDict(ExternalProgramTask):
+    def requires(self):
+        return ProduceGenome()
+
+    def program_args(self):
+        return [cfg.gatk_bin, 'CreateSequenceDictionary', '-R', self.input().path, '-O', self.output().path]
+
+    def output(self):
+        return luigi.LocalTarget('genomes/hg19_ensembl98/Homo_sapiens.GRCh37.dna.primary_assembly.dict')
+
+class ProduceAnnotations(luigi.Task):
+    """
+    Produce a reference annotations.
+    """
+    def output(self):
+        return luigi.LocalTarget('genomes/hg19_ensembl98/Homo_sapiens.GRCh37.87.gtf')
+
+class ProduceReference(ExternalProgramTask):
+    """
+    Produce a reference.
+    TODO: generate the reference
+    """
+
+    resources = {'cpu': 8, 'mem': 32}
+
+    def requires(self):
+        return [ProduceGenome(), ProduceAnnotations()]
+
+    def program_args(self):
+        return [cfg.star_bin,
+                '--runThreadN', self.resources['cpu'],
+                '--runMode', 'genomeGenerate',
+                '--genomeDir', os.path.dirname(self.output().path),
+                '--genomeFastaFiles', self.input()[0].path,
+                '--sjdbGTFfile', self.input()[1].path]
+
+    def run(self):
+        self.output().makedirs()
+        return super(ProduceReference, self).run()
+
+    def output(self):
+        return luigi.LocalTarget('references/hg19_ensembl98/Genome')
 
 class ProduceSampleFastqs(luigi.Task):
     """
@@ -58,8 +94,8 @@ class AlignSample(ExternalProgramTask):
     def program_args(self):
         args = [cfg.star_bin,
                 '--genomeDir', os.path.dirname(self.input()[0].path),
-                '--genomeLoad', 'LoadAndRemove',
                 '--outFileNamePrefix', os.path.dirname(self.output().path) + '/',
+                '--outSAMtype', 'BAM', 'SortedByCoordinate',
                 '--runThreadN', self.resources['cpu'],
                 # FIXME: '--readStrand', 'Forward',
                 '--readFilesCommand', 'zcat']
@@ -74,7 +110,7 @@ class AlignSample(ExternalProgramTask):
         return super(AlignSample, self).run()
 
     def output(self):
-        return luigi.LocalTarget(join(cfg.output_dir, 'aligned', self.experiment_id, self.sample_id, 'Aligned.out.sam'))
+        return luigi.LocalTarget(join(cfg.output_dir, 'aligned', self.experiment_id, self.sample_id, 'Aligned.sortedByCoord.out.bam'))
 
 class PrepareSampleReference(ExternalProgramTask):
     """
@@ -86,13 +122,13 @@ class PrepareSampleReference(ExternalProgramTask):
     resources = {'cpu': 8, 'mem': 32}
 
     def requires(self):
-        return [ProduceReferenceSequence(), AlignSample(self.experiment_id, self.sample_id)]
+        return [ProduceGenome(), AlignSample(self.experiment_id, self.sample_id)]
 
     def program_args(self):
         return [cfg.star_bin,
                 '--runMode', 'genomeGenerate',
                 '--genomeDir', os.path.dirname(self.output().path),
-                '--genomeFastaFiles', self.input()[1].path,
+                '--genomeFastaFiles', self.input()[0].path,
                 '--sjdbFileChrStartEnd', join(os.path.dirname(self.input()[1].path), 'SJ.out.tab'),
                 '--sjdbOverhang', 75,
                 '--runThreadN', self.resources['cpu']]
@@ -120,6 +156,7 @@ class AlignStep2Sample(ExternalProgramTask):
         args = [cfg.star_bin,
                 '--genomeDir', os.path.dirname(self.input()[0].path),
                 '--outFileNamePrefix', os.path.dirname(self.output().path) + '/',
+                '--outSAMtype', 'BAM', 'SortedByCoordinate',
                 '--runThreadN', self.resources['cpu'],
                 # FIXME: '--readStrand', 'Forward',
                 '--readFilesCommand', 'zcat']
@@ -134,14 +171,16 @@ class AlignStep2Sample(ExternalProgramTask):
         return super(AlignStep2Sample, self).run()
 
     def output(self):
-        return luigi.LocalTarget(join(cfg.output_dir, 'aligned-step2', self.experiment_id, self.sample_id, 'Aligned.out.sam'))
+        return luigi.LocalTarget(join(cfg.output_dir, 'aligned-step2', self.experiment_id, self.sample_id, 'Aligned.sortedByCoord.out.bam'))
 
 class AddOrReplaceReadGroups(ExternalProgramTask):
     experiment_id = luigi.Parameter()
     sample_id = luigi.Parameter()
 
+    resources = {'cpu': 1, 'mem': 24}
+
     def requires(self):
-        return AlignSample(self.experiment_id, self.sample_id)
+        return AlignStep2Sample(self.experiment_id, self.sample_id)
 
     def program_args(self):
         return [cfg.gatk_bin,
@@ -167,43 +206,43 @@ class MarkDuplicates(ExternalProgramTask):
     experiment_id = luigi.Parameter()
     sample_id = luigi.Parameter()
 
-    resources = {'cpu': 8, 'mem': 16}
+    resources = {'cpu': 1, 'mem': 24}
 
     def requires(self):
         return AddOrReplaceReadGroups(self.experiment_id, self.sample_id)
 
     def program_args(self):
         return [cfg.gatk_bin,
-                'MarkDuplicatesSpark',
-                '--spark-master', 'local[{}]'.format(self.resources['cpu']),
-                '-I', self.input().path,
-                '-O', self.output().path,
-                '--create-output-bam-index',
-                '--tmp-dir', cfg.tmp_dir,
-                '--read-validation-stringency', 'SILENT',
-                '--metrics-file', join(os.path.dirname(self.output().path), 'output.metrics')]
+                'MarkDuplicates',
+                '--INPUT', self.input().path,
+                '--OUTPUT', self.output().path,
+                '--CREATE_INDEX',
+                '--TMP_DIR', cfg.tmp_dir,
+                '--VALIDATION_STRINGENCY', 'SILENT',
+                '--METRICS_FILE', join(os.path.dirname(self.output().path), '{}.metrics'.format(self.sample_id))]
 
     def run(self):
         self.output().makedirs()
         return super(MarkDuplicates, self).run()
 
     def output(self):
-        return luigi.LocalTarget(join(cfg.output_dir, 'duplicates-marked', self.experiment_id, self.sample_id + '.bam'))
+        return luigi.LocalTarget(join(cfg.output_dir, 'duplicates-marked', self.experiment_id, '{}.bam'.format(self.sample_id)))
 
 class SplitNCigarReads(ExternalProgramTask):
     experiment_id = luigi.Parameter()
     sample_id = luigi.Parameter()
 
-    resources = {'cpu': 1, 'mem': 16}
+    resources = {'cpu': 1, 'mem': 24}
 
     def requires(self):
-        return [ProduceReferenceSequence(), MarkDuplicates(self.experiment_id, self.sample_id)]
+        return [ProduceGenome(), ProduceGenomeDict(), MarkDuplicates(self.experiment_id, self.sample_id)]
 
     def program_args(self):
+        genome, genome_dict, duplicates = self.input()
         return [cfg.gatk_bin,
                 'SplitNCigarReads',
-                '-R', self.input()[0].path,
-                '-I', self.input()[1].path,
+                '-R', genome.path,
+                '-I', duplicates.path,
                 '-O', self.output().path,
                 '--tmp-dir', cfg.tmp_dir]
 
@@ -218,17 +257,18 @@ class CallVariants(ExternalProgramTask):
     experiment_id = luigi.Parameter()
     sample_id = luigi.Parameter()
 
-    resources = {'cpu': 8, 'mem': 16}
+    resources = {'cpu': 8, 'mem': 24}
 
     def requires(self):
-        return [ProduceReferenceSequence(), SplitNCigarReads(self.experiment_id, self.sample_id)]
+        return [ProduceGenome(), SplitNCigarReads(self.experiment_id, self.sample_id)]
 
     def program_args(self):
+        genome, splitted = self.input()
         return [cfg.gatk_bin,
-                'HaplotypeCallerSpark',
-                '--spark-master', 'local[{}]'.format(self.resources['cpu']),
-                '-R', self.input()[0].path,
-                '-I', self.input()[1].path,
+                'HaplotypeCaller',
+                '--native-pair-hmm-threads', self.resources['cpu'],
+                '-R', genome.path,
+                '-I', splitted.path,
                 '-O', self.output().path,
                 '--dont-use-soft-clipped-bases',
                 '--standard-min-confidence-threshold-for-calling', 30.0,
@@ -245,23 +285,24 @@ class FilterVariants(ExternalProgramTask):
     experiment_id = luigi.Parameter()
     sample_id = luigi.Parameter()
 
-    resources = {'cpu': 1, 'mem': 16}
+    resources = {'cpu': 1, 'mem': 24}
 
     def requires(self):
-        return [ProduceReferenceSequence(), CallVariants(self.experiment_id, self.sample_id)]
+        return [ProduceGenome(), CallVariants(self.experiment_id, self.sample_id)]
 
     def program_args(self):
+        genome, variants = self.input()
         return [cfg.gatk_bin,
                 'VariantFiltration',
-                '-R', self.input()[0].path,
-                '-I', self.input()[1].path,
+                '-R', genome.path,
+                '-V', variants.path,
                 '-O', self.output().path,
                 '--cluster-window-size', 35,
                 '--cluster-size', 3,
-                '--filterName', 'FS',
-                '--filterExpression', 'FS > 30.0',
-                '--filterName', 'QD',
-                '--filterExpression', 'QD < 2.0',
+                '--filter-name', 'FS',
+                '--filter-expression', 'FS > 30.0',
+                '--filter-name', 'QD',
+                '--filter-expression', 'QD < 2.0',
                 '--tmp-dir', cfg.tmp_dir]
 
     def run(self):
@@ -271,7 +312,7 @@ class FilterVariants(ExternalProgramTask):
     def output(self):
         return luigi.LocalTarget(join(cfg.output_dir, 'filtered', self.experiment_id, '{}.vcf.gz'.format(self.sample_id)))
 
-class FilterExperiment(luigi.WrapperTask):
+class FilterVariantsFromExperiment(luigi.WrapperTask):
     experiment_id = luigi.Parameter()
     def requires(self):
         return [FilterVariants(self.experiment_id, os.path.basename(sample_id))
