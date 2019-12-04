@@ -1,8 +1,10 @@
-import luigi
-from luigi.contrib.external_program import ExternalProgramTask
 from glob import glob
 import os
 from os.path import join
+
+import luigi
+from luigi.contrib.external_program import ExternalProgramTask
+from luigi.util import requires
 
 """
 This pipeline largely based on GATK 3 guidelines for RNA-Seq variant calling
@@ -15,6 +17,10 @@ class rnaseq_variant_pipeline(luigi.Config):
     star_bin = luigi.Parameter()
     gatk_bin = luigi.Parameter()
 
+    genome = luigi.Parameter()
+    annotations = luigi.Parameter()
+    star_index_dir = luigi.Parameter()
+
     output_dir = luigi.Parameter()
     tmp_dir = luigi.Parameter()
 
@@ -25,25 +31,28 @@ class ProduceGenome(luigi.Task):
     Produce a reference genome sequence.
     """
     def output(self):
-        return luigi.LocalTarget('genomes/hg19_ensembl98/Homo_sapiens.GRCh37.dna.primary_assembly.fa')
+        return luigi.LocalTarget(cfg.genome)
 
+@requires(ProduceGenome)
 class ProduceGenomeDict(ExternalProgramTask):
-    def requires(self):
-        return ProduceGenome()
+    """
+    Produce a sequence dictionnary to query efficiently a genome.
+    """
 
     def program_args(self):
         return [cfg.gatk_bin, 'CreateSequenceDictionary', '-R', self.input().path, '-O', self.output().path]
 
     def output(self):
-        return luigi.LocalTarget('genomes/hg19_ensembl98/Homo_sapiens.GRCh37.dna.primary_assembly.dict')
+        return luigi.LocalTarget(os.path.splitext(self.input().path)[0] + '.dict')
 
 class ProduceAnnotations(luigi.Task):
     """
     Produce a reference annotations.
     """
     def output(self):
-        return luigi.LocalTarget('genomes/hg19_ensembl98/Homo_sapiens.GRCh37.87.gtf')
+        return luigi.LocalTarget(cfg.annotations)
 
+@requires(ProduceGenome, ProduceAnnotations)
 class ProduceReference(ExternalProgramTask):
     """
     Produce a reference.
@@ -51,9 +60,6 @@ class ProduceReference(ExternalProgramTask):
     """
 
     resources = {'cpu': 8, 'mem': 32}
-
-    def requires(self):
-        return [ProduceGenome(), ProduceAnnotations()]
 
     def program_args(self):
         return [cfg.star_bin,
@@ -68,7 +74,7 @@ class ProduceReference(ExternalProgramTask):
         return super(ProduceReference, self).run()
 
     def output(self):
-        return luigi.LocalTarget('references/hg19_ensembl98/Genome')
+        return luigi.LocalTarget(join(cfg.star_index_dir, 'Genome'))
 
 class ProduceSampleFastqs(luigi.Task):
     """
@@ -79,17 +85,13 @@ class ProduceSampleFastqs(luigi.Task):
     def output(self):
         return [luigi.LocalTarget(f) for f in sorted(glob(join(cfg.output_dir, 'data', self.experiment_id, self.sample_id, '*.fastq.gz')))]
 
+@requires(ProduceReference, ProduceSampleFastqs)
 class AlignSample(ExternalProgramTask):
     """
     Align a sample on a reference.
     """
-    experiment_id = luigi.Parameter()
-    sample_id = luigi.Parameter()
 
     resources = {'cpu': 8, 'mem': 32}
-
-    def requires(self):
-        return [ProduceReference(), ProduceSampleFastqs(self.experiment_id, self.sample_id)]
 
     def program_args(self):
         args = [cfg.star_bin,
@@ -112,17 +114,13 @@ class AlignSample(ExternalProgramTask):
     def output(self):
         return luigi.LocalTarget(join(cfg.output_dir, 'aligned', self.experiment_id, self.sample_id, 'Aligned.sortedByCoord.out.bam'))
 
+@requires(ProduceGenome, AlignSample)
 class PrepareSampleReference(ExternalProgramTask):
     """
     Prepare a personalized reference for the sample.
     """
-    experiment_id = luigi.Parameter()
-    sample_id = luigi.Parameter()
 
     resources = {'cpu': 8, 'mem': 32}
-
-    def requires(self):
-        return [ProduceGenome(), AlignSample(self.experiment_id, self.sample_id)]
 
     def program_args(self):
         return [cfg.star_bin,
@@ -140,17 +138,13 @@ class PrepareSampleReference(ExternalProgramTask):
     def output(self):
         return luigi.LocalTarget(join(cfg.output_dir, 'aligned-reference', self.experiment_id, self.sample_id, 'Genome'))
 
+@requires(PrepareSampleReference, ProduceSampleFastqs)
 class AlignStep2Sample(ExternalProgramTask):
     """
     Perform an alignment (2-step)
     """
-    experiment_id = luigi.Parameter()
-    sample_id = luigi.Parameter()
 
     resources = {'cpu': 8, 'mem': 32}
-
-    def requires(self):
-        return [PrepareSampleReference(self.experiment_id, self.sample_id), ProduceSampleFastqs(self.experiment_id, self.sample_id)]
 
     def program_args(self):
         args = [cfg.star_bin,
@@ -173,14 +167,10 @@ class AlignStep2Sample(ExternalProgramTask):
     def output(self):
         return luigi.LocalTarget(join(cfg.output_dir, 'aligned-step2', self.experiment_id, self.sample_id, 'Aligned.sortedByCoord.out.bam'))
 
+@requires(AlignStep2Sample)
 class AddOrReplaceReadGroups(ExternalProgramTask):
-    experiment_id = luigi.Parameter()
-    sample_id = luigi.Parameter()
 
     resources = {'cpu': 1, 'mem': 24}
-
-    def requires(self):
-        return AlignStep2Sample(self.experiment_id, self.sample_id)
 
     def program_args(self):
         return [cfg.gatk_bin,
@@ -202,14 +192,10 @@ class AddOrReplaceReadGroups(ExternalProgramTask):
     def output(self):
         return luigi.LocalTarget(join(cfg.output_dir, 'grouped', self.experiment_id, self.sample_id + '.bam'))
 
+@requires(AddOrReplaceReadGroups)
 class MarkDuplicates(ExternalProgramTask):
-    experiment_id = luigi.Parameter()
-    sample_id = luigi.Parameter()
 
     resources = {'cpu': 1, 'mem': 24}
-
-    def requires(self):
-        return AddOrReplaceReadGroups(self.experiment_id, self.sample_id)
 
     def program_args(self):
         return [cfg.gatk_bin,
@@ -228,14 +214,10 @@ class MarkDuplicates(ExternalProgramTask):
     def output(self):
         return luigi.LocalTarget(join(cfg.output_dir, 'duplicates-marked', self.experiment_id, '{}.bam'.format(self.sample_id)))
 
+@requires(ProduceGenome, ProduceGenomeDict, MarkDuplicates)
 class SplitNCigarReads(ExternalProgramTask):
-    experiment_id = luigi.Parameter()
-    sample_id = luigi.Parameter()
 
     resources = {'cpu': 1, 'mem': 24}
-
-    def requires(self):
-        return [ProduceGenome(), ProduceGenomeDict(), MarkDuplicates(self.experiment_id, self.sample_id)]
 
     def program_args(self):
         genome, genome_dict, duplicates = self.input()
@@ -253,14 +235,10 @@ class SplitNCigarReads(ExternalProgramTask):
     def output(self):
         return luigi.LocalTarget(join(cfg.output_dir, 'ncigar-splitted', self.experiment_id, self.sample_id + '.bam'))
 
+@requires(ProduceGenome, SplitNCigarReads)
 class CallVariants(ExternalProgramTask):
-    experiment_id = luigi.Parameter()
-    sample_id = luigi.Parameter()
 
     resources = {'cpu': 8, 'mem': 24}
-
-    def requires(self):
-        return [ProduceGenome(), SplitNCigarReads(self.experiment_id, self.sample_id)]
 
     def program_args(self):
         genome, splitted = self.input()
@@ -281,14 +259,11 @@ class CallVariants(ExternalProgramTask):
     def output(self):
         return luigi.LocalTarget(join(cfg.output_dir, 'called', self.experiment_id, '{}.vcf.gz'.format(self.sample_id)))
 
+@requires(ProduceGenome, CallVariants)
 class FilterVariants(ExternalProgramTask):
-    experiment_id = luigi.Parameter()
-    sample_id = luigi.Parameter()
+    """Filter variants with GATK VariantFiltration tool."""
 
     resources = {'cpu': 1, 'mem': 24}
-
-    def requires(self):
-        return [ProduceGenome(), CallVariants(self.experiment_id, self.sample_id)]
 
     def program_args(self):
         genome, variants = self.input()

@@ -7,3 +7,6 @@
 [submodule "contrib/picard"]
 	path = contrib/picard
 	url = https://github.com/broadinstitute/picard.git
+[submodule "contrib/ensembl-vep"]
+	path = contrib/ensembl-vep
+	url = https://github.com/Ensembl/ensembl-vep.git
