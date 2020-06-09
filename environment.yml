@@ -1,0 +1,9 @@
+name: rnaseq-variant-pipeline
+channels:
+- conda-forge
+- bioconda
+dependencies:
+- cutadapt
+- star==2.7.3a
+- gatk4==4.1.7.0
+- python=3

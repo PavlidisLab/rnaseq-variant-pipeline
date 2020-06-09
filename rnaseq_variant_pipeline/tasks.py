@@ -1,11 +1,3 @@
-from glob import glob
-import os
-from os.path import join
-
-import luigi
-from luigi.contrib.external_program import ExternalProgramTask
-from luigi.util import requires
-
 """
 This pipeline largely based on GATK 3 guidelines for RNA-Seq variant calling
 adapted for GATK 4.
@@ -13,18 +5,33 @@ adapted for GATK 4.
 Reference: https://software.broadinstitute.org/gatk/documentation/article.php?id=3891
 """
 
-class rnaseq_variant_pipeline(luigi.Config):
-    star_bin = luigi.Parameter()
-    gatk_bin = luigi.Parameter()
+import datetime
+from glob import glob
+import logging
+import os
+from os.path import join
 
+import luigi
+from luigi.task import flatten_output, flatten, getpaths
+from luigi.util import requires
+from bioluigi.tasks import cutadapt, fastqc
+from bioluigi.tasks.utils import RemoveTaskOutputOnFailureMixin, CreateTaskOutputDirectoriesBeforeRunMixin
+from bioluigi.scheduled_external_program import ScheduledExternalProgramTask
+
+logger = logging.getLogger('luigi-interface')
+
+luigi.namespace('rnaseq_variant_pipeline')
+
+class core(luigi.Config):
     genome = luigi.Parameter()
     annotations = luigi.Parameter()
     star_index_dir = luigi.Parameter()
 
-    output_dir = luigi.Parameter()
+    output_dir = luigi.Parameter(description='Output directory')
+    filtered_dir = luigi.Parameter(description='Output directory for filtered variants')
     tmp_dir = luigi.Parameter()
 
-cfg = rnaseq_variant_pipeline()
+cfg = core()
 
 class ProduceGenome(luigi.Task):
     """
@@ -34,13 +41,13 @@ class ProduceGenome(luigi.Task):
         return luigi.LocalTarget(cfg.genome)
 
 @requires(ProduceGenome)
-class ProduceGenomeDict(ExternalProgramTask):
+class ProduceGenomeDict(ScheduledExternalProgramTask):
     """
     Produce a sequence dictionnary to query efficiently a genome.
     """
 
     def program_args(self):
-        return [cfg.gatk_bin, 'CreateSequenceDictionary', '-R', self.input().path, '-O', self.output().path]
+        return ['gatk', 'CreateSequenceDictionary', '-R', self.input().path, '-O', self.output().path]
 
     def output(self):
         return luigi.LocalTarget(os.path.splitext(self.input().path)[0] + '.dict')
@@ -53,25 +60,22 @@ class ProduceAnnotations(luigi.Task):
         return luigi.LocalTarget(cfg.annotations)
 
 @requires(ProduceGenome, ProduceAnnotations)
-class ProduceReference(ExternalProgramTask):
+class ProduceReference(CreateTaskOutputDirectoriesBeforeRunMixin, ScheduledExternalProgramTask):
     """
     Produce a reference.
     TODO: generate the reference
     """
 
-    resources = {'cpu': 8, 'mem': 32}
+    cpus = 8
+    memory = 32
 
     def program_args(self):
-        return [cfg.star_bin,
-                '--runThreadN', self.resources['cpu'],
+        return ['STAR',
+                '--runThreadN', self.cpus,
                 '--runMode', 'genomeGenerate',
                 '--genomeDir', os.path.dirname(self.output().path),
                 '--genomeFastaFiles', self.input()[0].path,
                 '--sjdbGTFfile', self.input()[1].path]
-
-    def run(self):
-        self.output().makedirs()
-        return super(ProduceReference, self).run()
 
     def output(self):
         return luigi.LocalTarget(join(cfg.star_index_dir, 'Genome'))
@@ -85,73 +89,139 @@ class ProduceSampleFastqs(luigi.Task):
     def output(self):
         return [luigi.LocalTarget(f) for f in sorted(glob(join(cfg.output_dir, 'data', self.experiment_id, self.sample_id, '*.fastq.gz')))]
 
-@requires(ProduceReference, ProduceSampleFastqs)
-class AlignSample(ExternalProgramTask):
+@requires(ProduceSampleFastqs)
+class TrimSample(luigi.Task):
+    """
+    Trim Illumina universal adapters from reads.
+    """
+
+    walltime = datetime.timedelta(days=2)
+
+    def run(self):
+        r1, r2 = self.input()
+        r1_out, r2_out = self.output()
+        r1_out.makedirs()
+        r2_out.makedirs()
+        yield cutadapt.TrimPairedReads(
+                r1.path, r2.path,
+                r1_out.path, r2_out.path,
+                adapter_3prime='AGATCGGAAGAGC',
+                minimum_length=25,
+                cpus=8)
+
+    def output(self):
+        return [luigi.LocalTarget(join(cfg.output_dir, 'data-trimmed', self.experiment_id, self.sample_id, os.path.basename(i.path)))
+                for i in self.input()]
+
+class DynamicWrapperTask(luigi.Task):
+    """
+    Similar to WrapperTask but for dynamic dependencies yielded in the body of
+    the run() method.
+    """
+    def output(self):
+        tasks = []
+        if all(req.complete() for req in flatten(self.requires())):
+            try:
+                tasks = list(self.run())
+            except:
+                logger.exception('%s failed at run() step; the exception will not be raised because Luigi is still building the graph.', repr(self))
+
+        # FIXME: conserve task structure: the generator actually create an
+        # implicit array level even if a single task is yielded.
+        # For now, we just handle the special singleton case.
+        if len(tasks) == 1:
+            tasks = tasks[0]
+
+        return getpaths(tasks)
+
+    def complete(self):
+        # ensure that all static dependencies are satisfied
+        if not all(req.complete() for req in flatten(self.requires())):
+            return False
+
+        # check that all yielded tasks are completed
+        return all(req.complete() for chunk in self.run()
+                   for req in flatten(chunk))
+
+@requires(TrimSample)
+class QualityControlSample(DynamicWrapperTask):
+    """Generate FastQC reports for each mates of a given sample."""
+    def run(self):
+        destdir = join(cfg.output_dir, 'data-qc', self.experiment_id, self.sample_id)
+        os.makedirs(destdir, exist_ok=True)
+        yield [fastqc.GenerateReport(fastq.path, destdir)
+               for fastq in self.input()]
+
+class QualityControlExperiment(luigi.WrapperTask):
+    """Generate FastQC reports for each sample in a given experiment."""
+    experiment_id = luigi.Parameter()
+    def requires(self):
+        return [QualityControlSample(self.experiment_id, os.path.basename(sample_id))
+                for sample_id in glob(join(cfg.output_dir, 'data', self.experiment_id, '*'))]
+
+@requires(ProduceReference, TrimSample, QualityControlSample)
+class AlignSample(CreateTaskOutputDirectoriesBeforeRunMixin, ScheduledExternalProgramTask):
     """
     Align a sample on a reference.
     """
 
-    resources = {'cpu': 8, 'mem': 32}
+    cpus = 8
+    memory = 64
 
     def program_args(self):
-        args = [cfg.star_bin,
-                '--genomeDir', os.path.dirname(self.input()[0].path),
+        genome, fastqs, _ = self.input()
+        args = ['STAR',
+                '--genomeDir', os.path.dirname(genome.path),
                 '--outFileNamePrefix', os.path.dirname(self.output().path) + '/',
                 '--outSAMtype', 'BAM', 'SortedByCoordinate',
-                '--runThreadN', self.resources['cpu'],
+                '--runThreadN', self.cpus,
                 # FIXME: '--readStrand', 'Forward',
                 '--readFilesCommand', 'zcat']
 
         args.append('--readFilesIn')
-        args.extend(fastq.path for fastq in self.input()[1])
+        args.extend(fastq.path for fastq in fastqs)
 
         return args
-
-    def run(self):
-        self.output().makedirs()
-        return super(AlignSample, self).run()
 
     def output(self):
         return luigi.LocalTarget(join(cfg.output_dir, 'aligned', self.experiment_id, self.sample_id, 'Aligned.sortedByCoord.out.bam'))
 
 @requires(ProduceGenome, AlignSample)
-class PrepareSampleReference(ExternalProgramTask):
+class PrepareSampleReference(CreateTaskOutputDirectoriesBeforeRunMixin, ScheduledExternalProgramTask):
     """
     Prepare a personalized reference for the sample.
     """
 
-    resources = {'cpu': 8, 'mem': 32}
+    cpus = 8
+    memory = 64
 
     def program_args(self):
-        return [cfg.star_bin,
+        return ['STAR',
                 '--runMode', 'genomeGenerate',
                 '--genomeDir', os.path.dirname(self.output().path),
                 '--genomeFastaFiles', self.input()[0].path,
                 '--sjdbFileChrStartEnd', join(os.path.dirname(self.input()[1].path), 'SJ.out.tab'),
                 '--sjdbOverhang', 75,
-                '--runThreadN', self.resources['cpu']]
-
-    def run(self):
-        self.output().makedirs()
-        return super(PrepareSampleReference, self).run()
+                '--runThreadN', self.cpus]
 
     def output(self):
         return luigi.LocalTarget(join(cfg.output_dir, 'aligned-reference', self.experiment_id, self.sample_id, 'Genome'))
 
-@requires(PrepareSampleReference, ProduceSampleFastqs)
-class AlignStep2Sample(ExternalProgramTask):
+@requires(PrepareSampleReference, TrimSample)
+class AlignStep2Sample(CreateTaskOutputDirectoriesBeforeRunMixin, ScheduledExternalProgramTask):
     """
     Perform an alignment (2-step)
     """
 
-    resources = {'cpu': 8, 'mem': 32}
+    cpus = 8
+    memory = 64
 
     def program_args(self):
-        args = [cfg.star_bin,
+        args = ['STAR',
                 '--genomeDir', os.path.dirname(self.input()[0].path),
                 '--outFileNamePrefix', os.path.dirname(self.output().path) + '/',
                 '--outSAMtype', 'BAM', 'SortedByCoordinate',
-                '--runThreadN', self.resources['cpu'],
+                '--runThreadN', self.cpus,
                 # FIXME: '--readStrand', 'Forward',
                 '--readFilesCommand', 'zcat']
 
@@ -160,20 +230,17 @@ class AlignStep2Sample(ExternalProgramTask):
 
         return args
 
-    def run(self):
-        self.output().makedirs()
-        return super(AlignStep2Sample, self).run()
-
     def output(self):
         return luigi.LocalTarget(join(cfg.output_dir, 'aligned-step2', self.experiment_id, self.sample_id, 'Aligned.sortedByCoord.out.bam'))
 
 @requires(AlignStep2Sample)
-class AddOrReplaceReadGroups(ExternalProgramTask):
+class AddOrReplaceReadGroups(CreateTaskOutputDirectoriesBeforeRunMixin, RemoveTaskOutputOnFailureMixin, ScheduledExternalProgramTask):
 
-    resources = {'cpu': 1, 'mem': 24}
+    cpus = 1
+    memory = 32
 
     def program_args(self):
-        return [cfg.gatk_bin,
+        return ['gatk',
                 'AddOrReplaceReadGroups',
                 '-I', self.input().path,
                 '-O', self.output().path,
@@ -185,20 +252,17 @@ class AddOrReplaceReadGroups(ExternalProgramTask):
                 '--RGSM', 'sample',
                 '--TMP_DIR', cfg.tmp_dir]
 
-    def run(self):
-        self.output().makedirs()
-        return super(AddOrReplaceReadGroups, self).run()
-
     def output(self):
         return luigi.LocalTarget(join(cfg.output_dir, 'grouped', self.experiment_id, self.sample_id + '.bam'))
 
 @requires(AddOrReplaceReadGroups)
-class MarkDuplicates(ExternalProgramTask):
+class MarkDuplicates(CreateTaskOutputDirectoriesBeforeRunMixin, RemoveTaskOutputOnFailureMixin, ScheduledExternalProgramTask):
 
-    resources = {'cpu': 1, 'mem': 24}
+    cpus = 1
+    memory = 32
 
     def program_args(self):
-        return [cfg.gatk_bin,
+        return ['gatk',
                 'MarkDuplicates',
                 '--INPUT', self.input().path,
                 '--OUTPUT', self.output().path,
@@ -207,44 +271,40 @@ class MarkDuplicates(ExternalProgramTask):
                 '--VALIDATION_STRINGENCY', 'SILENT',
                 '--METRICS_FILE', join(os.path.dirname(self.output().path), '{}.metrics'.format(self.sample_id))]
 
-    def run(self):
-        self.output().makedirs()
-        return super(MarkDuplicates, self).run()
-
     def output(self):
         return luigi.LocalTarget(join(cfg.output_dir, 'duplicates-marked', self.experiment_id, '{}.bam'.format(self.sample_id)))
 
 @requires(ProduceGenome, ProduceGenomeDict, MarkDuplicates)
-class SplitNCigarReads(ExternalProgramTask):
+class SplitNCigarReads(CreateTaskOutputDirectoriesBeforeRunMixin, RemoveTaskOutputOnFailureMixin, ScheduledExternalProgramTask):
 
-    resources = {'cpu': 1, 'mem': 24}
+    cpus = 1
+    memory = 32
+    walltime = datetime.timedelta(days=10)
 
     def program_args(self):
         genome, genome_dict, duplicates = self.input()
-        return [cfg.gatk_bin,
+        return ['gatk',
                 'SplitNCigarReads',
                 '-R', genome.path,
                 '-I', duplicates.path,
                 '-O', self.output().path,
                 '--tmp-dir', cfg.tmp_dir]
 
-    def run(self):
-        self.output().makedirs()
-        return super(SplitNCigarReads, self).run()
-
     def output(self):
         return luigi.LocalTarget(join(cfg.output_dir, 'ncigar-splitted', self.experiment_id, self.sample_id + '.bam'))
 
 @requires(ProduceGenome, SplitNCigarReads)
-class CallVariants(ExternalProgramTask):
+class CallVariants(CreateTaskOutputDirectoriesBeforeRunMixin, RemoveTaskOutputOnFailureMixin, ScheduledExternalProgramTask):
 
-    resources = {'cpu': 8, 'mem': 24}
+    cpus = 8
+    memory = 32
+    walltime = datetime.timedelta(days=30)
 
     def program_args(self):
         genome, splitted = self.input()
-        return [cfg.gatk_bin,
+        return ['gatk',
                 'HaplotypeCaller',
-                '--native-pair-hmm-threads', self.resources['cpu'],
+                '--native-pair-hmm-threads', self.cpus,
                 '-R', genome.path,
                 '-I', splitted.path,
                 '-O', self.output().path,
@@ -252,22 +312,19 @@ class CallVariants(ExternalProgramTask):
                 '--standard-min-confidence-threshold-for-calling', 30.0,
                 '--tmp-dir', cfg.tmp_dir]
 
-    def run(self):
-        self.output().makedirs()
-        return super(CallVariants, self).run()
-
     def output(self):
         return luigi.LocalTarget(join(cfg.output_dir, 'called', self.experiment_id, '{}.vcf.gz'.format(self.sample_id)))
 
 @requires(ProduceGenome, CallVariants)
-class FilterVariants(ExternalProgramTask):
+class FilterVariants(CreateTaskOutputDirectoriesBeforeRunMixin, RemoveTaskOutputOnFailureMixin, ScheduledExternalProgramTask):
     """Filter variants with GATK VariantFiltration tool."""
 
-    resources = {'cpu': 1, 'mem': 24}
+    cpus = 1
+    memory = 32
 
     def program_args(self):
         genome, variants = self.input()
-        return [cfg.gatk_bin,
+        return ['gatk',
                 'VariantFiltration',
                 '-R', genome.path,
                 '-V', variants.path,
@@ -280,12 +337,8 @@ class FilterVariants(ExternalProgramTask):
                 '--filter-expression', 'QD < 2.0',
                 '--tmp-dir', cfg.tmp_dir]
 
-    def run(self):
-        self.output().makedirs()
-        return super(FilterVariants, self).run()
-
     def output(self):
-        return luigi.LocalTarget(join(cfg.output_dir, 'filtered', self.experiment_id, '{}.vcf.gz'.format(self.sample_id)))
+        return luigi.LocalTarget(join(cfg.output_dir, cfg.filtered_dir, self.experiment_id, '{}.vcf.gz'.format(self.sample_id)))
 
 class FilterVariantsFromExperiment(luigi.WrapperTask):
     experiment_id = luigi.Parameter()
