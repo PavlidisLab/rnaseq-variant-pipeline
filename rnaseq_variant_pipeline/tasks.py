@@ -28,7 +28,6 @@ class core(luigi.Config):
     star_index_dir = luigi.Parameter()
 
     output_dir = luigi.Parameter(description='Output directory')
-    filtered_dir = luigi.Parameter(description='Output directory for filtered variants')
     tmp_dir = luigi.Parameter()
 
 cfg = core()
@@ -338,7 +337,7 @@ class FilterVariants(CreateTaskOutputDirectoriesBeforeRunMixin, RemoveTaskOutput
                 '--tmp-dir', cfg.tmp_dir]
 
     def output(self):
-        return luigi.LocalTarget(join(cfg.output_dir, cfg.filtered_dir, self.experiment_id, '{}.vcf.gz'.format(self.sample_id)))
+        return luigi.LocalTarget(join(cfg.output_dir, 'filtered', self.experiment_id, '{}.vcf.gz'.format(self.sample_id)))
 
 class FilterVariantsFromExperiment(luigi.WrapperTask):
     experiment_id = luigi.Parameter()
